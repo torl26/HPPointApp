@@ -1,0 +1,456 @@
+// 健康ポイントアプリ データベース定義（テーブル定義書から作成）
+// テーブル名・列名は定義書と同じ snake_case で DB に作り、コードでは @map / @@map で camelCase の名前を使う。
+// 定義書を変えたらこのファイルも直し、npx prisma migrate dev --name <変更内容> でマイグレーションを作る。
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+// 接続先（DATABASE_URL）は prisma.config.ts で読む（Prisma 7 の書き方）
+datasource db {
+  provider = "postgresql"
+}
+
+/// m_grant_rule（付与ルール）: 実績種別ごとのポイント数・上限・有効期限。値は設定として持ち、市との協議結果で入れ替える。
+model GrantRule {
+  ruleId      Int       @id @default(autoincrement()) @map("rule_id") // 付与ルールID
+  recordType  String    @map("record_type") @db.VarChar(20) // 実績種別（参加／歩数）
+  points      Int // 1回の標準付与ポイント数。値は市と協議中
+  maxPoints   Int       @map("max_points") // イベントごとに設定できる付与ポイント数の上限
+  annualLimit Int?      @map("annual_limit") // 1人あたりの年度内付与上限（空欄は上限なし）。仮で年度ごとの上限。値は市と協議中
+  validMonths Int       @default(12) @map("valid_months") // 付与からの有効期間（月）。仮で1年（市と協議中）
+  noticeDays  Int       @default(30) @map("notice_days") // 失効の何日前に事前通知するか。仮で30日前
+  validFrom   DateTime  @map("valid_from") @db.Date // このルールの適用開始日
+  validTo     DateTime? @map("valid_to") @db.Date // このルールの適用終了日（空欄は無期限）
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+
+  @@map("m_grant_rule")
+}
+
+/// m_school_district（校区マスタ）: 利用者の居住校区と会場の所在校区。集計の軸にも使う。
+model SchoolDistrict {
+  districtCode String @id @map("district_code") @db.VarChar(10) // 校区コード
+  name         String @db.VarChar(50) // 校区名
+  sortOrder    Int    @default(0) @map("sort_order") // 表示順
+
+  venues Venue[]
+  users  User[]
+
+  @@map("m_school_district")
+}
+
+/// m_venue（会場マスタ）: イベント会場の名前と所在地。
+model Venue {
+  venueId      Int     @id @default(autoincrement()) @map("venue_id") // 会場ID
+  name         String  @db.VarChar(100) // 会場名
+  address      String  @db.VarChar(200) // 所在地
+  districtCode String? @map("district_code") @db.VarChar(10) // 所在校区
+
+  district SchoolDistrict? @relation(fields: [districtCode], references: [districtCode])
+  events   Event[]
+
+  @@map("m_venue")
+}
+
+/// m_exercise_preset（運動の選択肢）: 運動を登録するときの選択肢。最後に「その他」を置き、選んだときは名前を自由に入力する。
+model ExercisePreset {
+  presetId  Int     @id @default(autoincrement()) @map("preset_id") // 選択肢ID
+  name      String  @db.VarChar(50) // 運動の名前
+  unit      String  @db.VarChar(10) // 単位（times／minutes／sets）
+  sortOrder Int     @map("sort_order") // 表示順
+  isActive  Boolean @default(true) @map("is_active") // 有効フラグ。使わなくなった選択肢は false にして隠す
+
+  exercises Exercise[]
+
+  @@map("m_exercise_preset")
+}
+
+/// t_account（アカウント）: 全利用者区分のログイン情報。市民・加盟店・主催者・市職員・受付端末を1つの表で管理する。
+model Account {
+  accountId      Int       @id @default(autoincrement()) @map("account_id") // アカウントID
+  loginId        String    @unique @map("login_id") @db.VarChar(255) // ログインID（市民・職員はメールアドレス、加盟店・端末は発行ID）。一意
+  passwordHash   String    @map("password_hash") @db.VarChar(255) // パスワードのハッシュ値。平文は保存しない
+  accountType    String    @map("account_type") @db.VarChar(20) // 利用者区分（市民／加盟店／主催者／市職員／受付端末）
+  eventId        Int?      @map("event_id") // 受付端末アカウントの対象イベント。受付端末のときだけ入る。イベント終了で無効
+  failedCount    Int       @default(0) @map("failed_count") // ログインの連続失敗回数
+  lockedUntil    DateTime? @map("locked_until") @db.Timestamptz(3) // ロック解除日時（空欄はロックなし）
+  resetTokenHash String?   @map("reset_token_hash") @db.VarChar(64) // パスワード再設定トークンのハッシュ値。再設定の申し込み時に入る。実行後に空欄に戻す
+  resetExpiresAt DateTime? @map("reset_expires_at") @db.Timestamptz(3) // 再設定トークンの有効期限
+  status         String    @default("有効") @db.VarChar(10) // 状態（有効／無効）
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3) // 更新日時
+
+  event         Event?         @relation(fields: [eventId], references: [eventId])
+  sessions      Session[]
+  refreshTokens RefreshToken[]
+  user          User?
+  staff         Staff?
+  attendances   Attendance[]
+  shop          Shop?
+  logs          Log[]
+
+  @@map("t_account")
+}
+
+/// t_session（セッション）: ログイン中のセッション。各モジュールの Init が HPAuth でここを確認する。
+model Session {
+  sessionId String   @id @map("session_id") @db.VarChar(64) // セッションID（推測できない乱数）
+  accountId Int      @map("account_id") // ログインしたアカウント
+  client    String   @default("web") @db.VarChar(10) // 利用端末（web／app）。app は市民アプリのアクセストークン。確認時に期限を延ばさない
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3) // 有効期限
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3) // 発行日時
+
+  account Account @relation(fields: [accountId], references: [accountId])
+
+  @@map("t_session")
+}
+
+/// t_refresh_token（リフレッシュトークン）: 市民アプリのリフレッシュトークン。トークンそのものは保存せず、ハッシュ値だけを持つ。
+model RefreshToken {
+  refreshTokenId Int       @id @default(autoincrement()) @map("refresh_token_id") // リフレッシュトークンID
+  accountId      Int       @map("account_id") // 発行したアカウント
+  tokenHash      String    @unique @map("token_hash") @db.VarChar(64) // トークンのハッシュ値。一意。平文は保存しない
+  familyId       String    @map("family_id") @db.VarChar(36) // 1回のログインから続く系列のID（UUID）。再利用を検知したら系列ごと無効にする
+  sessionId      String?   @map("session_id") @db.VarChar(64) // 組になるアクセストークン（t_session のセッションID）
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz(3) // 有効期限
+  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(3) // 無効にした日時（空欄は有効）
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3) // 発行日時
+
+  account Account @relation(fields: [accountId], references: [accountId])
+
+  @@map("t_refresh_token")
+}
+
+/// t_user（利用者）: 市民の本人情報。退会は論理削除で、ポイント台帳は残す。
+model User {
+  userId       Int       @id @default(autoincrement()) @map("user_id") // 利用者ID
+  accountId    Int       @unique @map("account_id") // ログイン用アカウント。一意
+  name         String    @db.VarChar(50) // 氏名
+  birthDate    DateTime  @map("birth_date") @db.Date // 生年月日。集計では年代に変換して使う
+  districtCode String    @map("district_code") @db.VarChar(10) // 居住校区
+  email        String    @unique @db.VarChar(255) // メールアドレス（通知先）。一意
+  status       String    @default("有効") @db.VarChar(10) // 状態（有効／退会）
+  withdrawnAt  DateTime? @map("withdrawn_at") @db.Timestamptz(3) // 退会日時
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+  updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3) // 更新日時
+
+  account        Account         @relation(fields: [accountId], references: [accountId])
+  district       SchoolDistrict  @relation(fields: [districtCode], references: [districtCode])
+  displaySetting DisplaySetting?
+  qrTokens       QrToken[]
+  deviceTokens   DeviceToken[]
+  attendances    Attendance[]
+  stepRecords    StepRecord[]
+  exercises      Exercise[]
+  exerciseLogs   ExerciseLog[]
+  stepGoals      StepGoal[]
+  mealLogs       MealLog[]
+  pointLedgers   PointLedger[]
+  redeems        Redeem[]
+
+  @@map("t_user")
+}
+
+/// t_display_setting（表示設定）: 利用者ごとの文字の大きさと通知の設定。1人1行。
+model DisplaySetting {
+  userId        Int      @id @map("user_id") // 利用者
+  fontScale     String   @default("normal") @map("font_scale") @db.VarChar(10) // 文字の大きさ（normal／large／xlarge）
+  notifyEnabled Boolean  @map("notify_enabled") // プッシュ通知を受けるか
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3) // 更新日時
+
+  user User @relation(fields: [userId], references: [userId])
+
+  @@map("t_display_setting")
+}
+
+/// t_staff（市職員・主催者）: 市職員とイベント主催者の情報。承認者・登録者の記録にも使う。
+model Staff {
+  staffId      Int      @id @default(autoincrement()) @map("staff_id") // 職員・主催者ID
+  accountId    Int      @unique @map("account_id") // ログイン用アカウント。一意
+  name         String   @db.VarChar(50) // 氏名
+  staffType    String   @map("staff_type") @db.VarChar(10) // 区分（市職員／主催者）
+  organization String?  @db.VarChar(100) // 所属（課名・団体名）
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+
+  account     Account      @relation(fields: [accountId], references: [accountId])
+  events      Event[]
+  settlements Settlement[]
+
+  @@map("t_staff")
+}
+
+/// t_qr_token（利用者QRトークン）: マイQRコードに表示するワンタイムトークン。1人が同時に持てる有効なトークンは1つ。
+model QrToken {
+  token     String    @id @db.VarChar(64) // トークン（推測できない乱数）。個人情報を含めない
+  userId    Int       @map("user_id") // 利用者
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3) // 有効期限（発行から数分）
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3) // 使用日時（空欄は未使用）
+  revoked   Boolean   @default(false) // 新しいトークンの発行で無効にされたか
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3) // 発行日時
+
+  user User @relation(fields: [userId], references: [userId])
+
+  @@map("t_qr_token")
+}
+
+/// t_device_token（通知の送り先端末）: プッシュ通知を届ける市民アプリの端末。1人が複数の端末を登録できる。
+model DeviceToken {
+  deviceTokenId Int       @id @default(autoincrement()) @map("device_token_id") // 端末登録ID
+  userId        Int       @map("user_id") // 利用者
+  token         String    @unique @db.VarChar(512) // 端末トークン（FCM／APNs が発行）。一意
+  platform      String    @db.VarChar(10) // OS（ios／android）
+  isActive      Boolean   @default(true) @map("is_active") // 有効フラグ。送信先から無効と返ったら false にする
+  registeredAt  DateTime  @default(now()) @map("registered_at") @db.Timestamptz(3) // 登録日時
+  lastUsedAt    DateTime? @map("last_used_at") @db.Timestamptz(3) // 最後に通知を送った日時
+
+  user User @relation(fields: [userId], references: [userId])
+
+  @@map("t_device_token")
+}
+
+/// t_event（イベント）: 健康イベントの情報。
+model Event {
+  eventId     Int      @id @default(autoincrement()) @map("event_id") // イベントID
+  name        String   @db.VarChar(100) // イベント名
+  startAt     DateTime @map("start_at") @db.Timestamptz(3) // 開始日時
+  endAt       DateTime @map("end_at") @db.Timestamptz(3) // 終了日時。受付端末アカウントの無効化に使う
+  venueId     Int      @map("venue_id") // 会場
+  capacity    Int? // 定員（空欄は定員なし）
+  grantPoints Int      @map("grant_points") // 参加時の付与ポイント数。m_grant_rule.max_points 以内
+  status      String   @default("下書き") @db.VarChar(10) // 状態（下書き／公開／中止）
+  eventQr     String?  @map("event_qr") @db.VarChar(64) // 受付用QRコード。hpEventQrIssue で発行
+  createdBy   Int      @map("created_by") // 登録した職員・主催者
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3) // 更新日時
+
+  venue          Venue        @relation(fields: [venueId], references: [venueId])
+  createdByStaff Staff        @relation(fields: [createdBy], references: [staffId])
+  accounts       Account[]
+  attendances    Attendance[]
+
+  @@map("t_event")
+}
+
+/// t_attendance（イベント参加実績）: 参加受付の記録。付与済みフラグでポイントの二重付与を防ぐ。
+model Attendance {
+  attendanceId      Int       @id @default(autoincrement()) @map("attendance_id") // 参加実績ID
+  eventId           Int       @map("event_id") // イベント。event_id と user_id の組で一意（二重受付防止）
+  userId            Int       @map("user_id") // 参加者
+  attendedAt        DateTime  @default(now()) @map("attended_at") @db.Timestamptz(3) // 受付日時
+  terminalAccountId Int       @map("terminal_account_id") // 受付した端末のアカウント
+  granted           Boolean   @default(false) // 付与済みフラグ。未付与であることを条件に更新する
+  grantedAt         DateTime? @map("granted_at") @db.Timestamptz(3) // 付与日時
+
+  event           Event   @relation(fields: [eventId], references: [eventId])
+  user            User    @relation(fields: [userId], references: [userId])
+  terminalAccount Account @relation(fields: [terminalAccountId], references: [accountId])
+
+  @@unique([eventId, userId])
+  @@map("t_attendance")
+}
+
+/// t_step_record（歩数記録）: 1人1日1件の歩数。スマートフォンの歩数データから自動で取得した値だけを入れる。
+model StepRecord {
+  stepRecordId Int       @id @default(autoincrement()) @map("step_record_id") // 歩数記録ID
+  userId       Int       @map("user_id") // 利用者
+  recordDate   DateTime  @map("record_date") @db.Date // 対象日（日本時間）。user_id・record_date の組で一意（1人1日1件）
+  steps        Int // 歩数。0〜100,000
+  source       String    @db.VarChar(20) // 取得元（healthkit／health_connect）。手入力・修正はない（不正防止）
+  grantedAt    DateTime? @map("granted_at") @db.Timestamptz(3) // ポイントを付与して確定した日時。入ったら歩数を更新しない。0ポイントの日も入れる
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+  updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3) // 更新日時
+
+  user           User            @relation(fields: [userId], references: [userId])
+  stepRecordLogs StepRecordLog[]
+
+  @@unique([userId, recordDate])
+  @@map("t_step_record")
+}
+
+/// t_step_record_log（歩数の変更ログ）: 確定前の日に歩数を取得し直したときの変更前後の値。追記だけで、更新・削除しない。
+model StepRecordLog {
+  stepRecordLogId Int      @id @default(autoincrement()) @map("step_record_log_id") // 変更ログID
+  stepRecordId    Int      @map("step_record_id") // 対象の歩数記録
+  previousSteps   Int?     @map("previous_steps") // 変更前の歩数。新しく登録したときは空欄
+  newSteps        Int      @map("new_steps") // 変更後の歩数
+  source          String   @db.VarChar(20) // 取得元（healthkit／health_connect）
+  changedAt       DateTime @default(now()) @map("changed_at") @db.Timestamptz(3) // 変更日時
+
+  stepRecord StepRecord @relation(fields: [stepRecordId], references: [stepRecordId])
+
+  @@map("t_step_record_log")
+}
+
+/// t_exercise（登録した運動）: 利用者が自分で登録した運動。削除せず is_active で隠す。
+model Exercise {
+  exerciseId Int      @id @default(autoincrement()) @map("exercise_id") // 運動ID
+  userId     Int      @map("user_id") // 利用者
+  name       String   @db.VarChar(50) // 運動の名前。「その他」のときは利用者が入力した名前
+  unit       String   @db.VarChar(10) // 単位（times／minutes／sets）
+  presetId   Int?     @map("preset_id") // 選んだ選択肢。「その他」で自由入力したときは空欄
+  isActive   Boolean  @default(true) @map("is_active") // 有効フラグ。やめた運動は false にして隠す
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+
+  user          User            @relation(fields: [userId], references: [userId])
+  preset        ExercisePreset? @relation(fields: [presetId], references: [presetId])
+  exerciseLogs  ExerciseLog[]
+  exerciseGoals ExerciseGoal[]
+
+  @@map("t_exercise")
+}
+
+/// t_exercise_log（運動の実施記録）: 1日1運動1件の実施量。利用者が修正できる。
+model ExerciseLog {
+  exerciseLogId Int      @id @default(autoincrement()) @map("exercise_log_id") // 実施記録ID
+  userId        Int      @map("user_id") // 利用者
+  exerciseId    Int      @map("exercise_id") // 運動
+  recordDate    DateTime @map("record_date") @db.Date // 実施日（日本時間）。exercise_id・record_date の組で一意
+  amount        Int // 実施量（単位は t_exercise.unit）
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3) // 更新日時
+
+  user     User     @relation(fields: [userId], references: [userId])
+  exercise Exercise @relation(fields: [exerciseId], references: [exerciseId])
+
+  @@unique([exerciseId, recordDate])
+  @@map("t_exercise_log")
+}
+
+/// t_step_goal（歩数の週目標）: 歩数の週目標の履歴。変えた週から新しい行を追加する。
+model StepGoal {
+  stepGoalId    Int      @id @default(autoincrement()) @map("step_goal_id") // 週目標ID
+  userId        Int      @map("user_id") // 利用者
+  weeklySteps   Int      @map("weekly_steps") // 週の目標歩数。1,000〜700,000。行がなければ初期値（週35,000歩）を使う
+  effectiveFrom DateTime @map("effective_from") @db.Date // 適用開始日（月曜日）。user_id・effective_from の組で一意
+
+  user User @relation(fields: [userId], references: [userId])
+
+  @@unique([userId, effectiveFrom])
+  @@map("t_step_goal")
+}
+
+/// t_exercise_goal（運動の目標）: 運動ごとの目標の履歴。変えた週から新しい行を追加する。
+model ExerciseGoal {
+  exerciseGoalId Int      @id @default(autoincrement()) @map("exercise_goal_id") // 運動目標ID
+  exerciseId     Int      @map("exercise_id") // 運動
+  period         String   @db.VarChar(10) // 期間（daily／weekly）
+  targetAmount   Int      @map("target_amount") // 目標値。1〜999
+  effectiveFrom  DateTime @map("effective_from") @db.Date // 適用開始日（月曜日）。exercise_id・effective_from の組で一意
+
+  exercise Exercise @relation(fields: [exerciseId], references: [exerciseId])
+
+  @@unique([exerciseId, effectiveFrom])
+  @@map("t_exercise_goal")
+}
+
+/// t_meal_log（食事記録）: 食事写真の記録。本人が見返すためのもので、ポイントの対象にはしない。
+model MealLog {
+  mealLogId  Int      @id @default(autoincrement()) @map("meal_log_id") // 食事記録ID
+  userId     Int      @map("user_id") // 利用者
+  recordDate DateTime @map("record_date") @db.Date // 食事の日（日本時間）。索引（user_id, record_date）
+  mealType   String   @map("meal_type") @db.VarChar(10) // 区分（breakfast／lunch／dinner／snack）
+  imageKey   String   @map("image_key") @db.VarChar(200) // 写真の保存先（hpImageStore のキー）。位置情報は消して保存する
+  memo       String?  @db.VarChar(100) // メモ
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+
+  user User @relation(fields: [userId], references: [userId])
+
+  @@index([userId, recordDate])
+  @@map("t_meal_log")
+}
+
+/// t_point_ledger（ポイント台帳）: ポイントの付与・利用・失効を1件ずつ記録する。記録は消さず、追加だけで残高を変える。
+model PointLedger {
+  ledgerId      Int       @id @default(autoincrement()) @map("ledger_id") // 台帳の記録ID
+  userId        Int       @map("user_id") // 対象の利用者
+  kind          String    @db.VarChar(10) // 種別（付与／利用／失効）
+  points        Int // ポイント数（常に正の値。増減は kind で区別）
+  remaining     Int? // 付与記録の残りポイント。付与のときだけ入る。利用・失効で減らす
+  sourceType    String    @map("source_type") @db.VarChar(10) // 元の実績の種類（参加／歩数／利用取引／失効処理）
+  sourceId      Int?      @map("source_id") // 元になった参加・歩数記録・取引のID
+  grantLedgerId Int?      @map("grant_ledger_id") // 取り崩した付与記録。利用・失効のときだけ入る。期限の近い順に取り崩す
+  recordedAt    DateTime  @default(now()) @map("recorded_at") @db.Timestamptz(3) // 記録した日時
+  expiresAt     DateTime? @map("expires_at") @db.Date // 有効最終日（この日まで使える。付与のときだけ）。有効期限は仮で付与から1年（市と協議中）
+
+  user        User          @relation(fields: [userId], references: [userId])
+  grantLedger PointLedger?  @relation("t_point_ledger_grant_ledger_id", fields: [grantLedgerId], references: [ledgerId])
+  drawdowns   PointLedger[] @relation("t_point_ledger_grant_ledger_id")
+
+  @@map("t_point_ledger")
+}
+
+/// t_shop（加盟店）: ポイントを使える店舗の情報。
+model Shop {
+  shopId         Int      @id @default(autoincrement()) @map("shop_id") // 加盟店ID
+  accountId      Int      @unique @map("account_id") // 店舗用ログインアカウント。一意
+  name           String   @db.VarChar(100) // 店舗名。name と address の組で一意
+  address        String   @db.VarChar(200) // 所在地
+  businessType   String   @map("business_type") @db.VarChar(30) // 業種
+  email          String   @db.VarChar(255) // 連絡先メールアドレス。初回設定メール・精算の通知先
+  settlementType String?  @map("settlement_type") @db.VarChar(20) // 精算口座区分。口座番号はこのシステムに保存しない
+  status         String   @default("有効") @db.VarChar(10) // 状態（有効／停止）。未精算の取引があると停止できない
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3) // 登録日時
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3) // 更新日時
+
+  account     Account      @relation(fields: [accountId], references: [accountId])
+  redeems     Redeem[]
+  settlements Settlement[]
+
+  @@unique([name, address])
+  @@map("t_shop")
+}
+
+/// t_redeem（利用取引）: 加盟店でのポイント利用の記録。月次精算の対象になる。
+model Redeem {
+  redeemId     Int      @id @default(autoincrement()) @map("redeem_id") // 取引ID
+  shopId       Int      @map("shop_id") // 利用した加盟店
+  userId       Int      @map("user_id") // 利用者
+  points       Int // 利用ポイント数。1以上
+  redeemedAt   DateTime @default(now()) @map("redeemed_at") @db.Timestamptz(3) // 取引日時
+  settlementId Int?     @map("settlement_id") // 締めた精算明細（空欄は未締め）
+  settled      Boolean  @default(false) // 精算済み（支払確定）か
+
+  shop       Shop        @relation(fields: [shopId], references: [shopId])
+  user       User        @relation(fields: [userId], references: [userId])
+  settlement Settlement? @relation(fields: [settlementId], references: [settlementId])
+
+  @@map("t_redeem")
+}
+
+/// t_settlement（精算明細）: 加盟店ごと・月ごとの支払額。締めで作り、支払確定で更新する。
+model Settlement {
+  settlementId Int       @id @default(autoincrement()) @map("settlement_id") // 精算明細ID
+  shopId       Int       @map("shop_id") // 加盟店。shop_id と target_month の組で一意（二重締め防止）
+  targetMonth  String    @map("target_month") @db.VarChar(7) // 対象月（YYYY-MM）
+  redeemCount  Int       @default(0) @map("redeem_count") // 取引件数
+  totalPoints  Int       @default(0) @map("total_points") // ポイント合計
+  rate         Decimal   @db.Decimal(10, 2) // 1ポイントあたりの換金額。市と協議中。設定値から写す
+  amount       Int       @default(0) // 支払額（円）。total_points × rate
+  status       String    @default("締め済み") @db.VarChar(10) // 状態（締め済み／支払確定）。精算方法は仮で市から月次換金
+  closedAt     DateTime  @default(now()) @map("closed_at") @db.Timestamptz(3) // 締め日時
+  paidAt       DateTime? @map("paid_at") @db.Timestamptz(3) // 支払確定日時
+  paidBy       Int?      @map("paid_by") // 支払確定した市職員
+
+  shop        Shop     @relation(fields: [shopId], references: [shopId])
+  paidByStaff Staff?   @relation(fields: [paidBy], references: [staffId])
+  redeems     Redeem[]
+
+  @@unique([shopId, targetMonth])
+  @@map("t_settlement")
+}
+
+/// t_log（処理ログ）: 各モジュールの Dispose と HPAuth が書く処理ログ・認証ログ。
+model Log {
+  logId      Int      @id @default(autoincrement()) @map("log_id") // ログID
+  module     String   @db.VarChar(30) // モジュール名
+  logType    String   @map("log_type") @db.VarChar(10) // 種類（処理／認証）
+  accountId  Int?     @map("account_id") // 操作したアカウント（バッチは空欄）
+  resultCode String   @map("result_code") @db.VarChar(11) // 戻り値（0xC005_0001 の形）
+  message    String?  @db.VarChar(500) // 件数などの内容。個人情報を書かない
+  loggedAt   DateTime @default(now()) @map("logged_at") @db.Timestamptz(3) // 記録日時
+
+  account Account? @relation(fields: [accountId], references: [accountId])
+
+  @@map("t_log")
+}
