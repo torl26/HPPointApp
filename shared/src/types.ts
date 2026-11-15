@@ -31,3 +31,10 @@ export interface HPContext {
   now: Date; // 処理日時。1回の呼び出しの間は固定する。
   isBatch: boolean; // 定時バッチから起動されたか。
 }
+
+
+export interface HPEventQrResult {
+  loginId:         string;  // 受付端末アカウントのログインID
+  initialPassword: string;  // 初期パスワード（画面に1回だけ表示）
+  qrText:          string;  // ログイン画面のURL（ログインID入り）
+}
