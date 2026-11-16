@@ -32,6 +32,27 @@ export interface HPContext {
   isBatch: boolean; // 定時バッチから起動されたか。
 }
 
+// 項目ごとの入力チェック規則。
+// pattern・month・boolean は、呼び出し元の要件を共通側で検査するための追加ルール。
+export type HPValidationPattern = "totp" | "uuid" | "hex64" | "imageKey";
+
+export type HPRule =
+  | { kind: "required" }
+  | { kind: "minLength"; min: number }
+  | { kind: "maxLength"; max: number }
+  | { kind: "email" }
+  | { kind: "date" } // YYYY-MM-DD
+  | { kind: "intRange"; min: number; max: number }
+  | { kind: "oneOf"; values: string[] }
+  | { kind: "pattern"; pattern: HPValidationPattern }
+  | { kind: "month" } // YYYY-MM
+  | { kind: "boolean" };
+
+export type HPRuleSet = Record<string, HPRule[]>;
+
+export interface HPValidateResult {
+  errors: { field: string; rule: HPRule["kind"] }[];
+}
 
 export interface HPEventQrResult {
   loginId:         string;  // 受付端末アカウントのログインID
