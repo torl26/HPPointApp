@@ -53,3 +53,9 @@ export type HPRuleSet = Record<string, HPRule[]>;
 export interface HPValidateResult {
   errors: { field: string; rule: HPRule["kind"] }[];
 }
+
+export interface HPEventQrResult {
+  loginId:         string;  // 受付端末アカウントのログインID
+  initialPassword: string;  // 初期パスワード（画面に1回だけ表示）
+  qrText:          string;  // ログイン画面のURL（ログインID入り）
+}
